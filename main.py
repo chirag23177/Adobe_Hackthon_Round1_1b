@@ -1,518 +1,845 @@
 #!/usr/bin/env python3
 """
-Document Intelligence System - Main Pipeline
-===========================================
-
-A CPU-only, offline document intelligence system that extracts and ranks 
-relevant sections from PDF documents based on persona and job-to-be-done.
-
-Author: Adobe Hackathon Team
-Date: July 28, 2025
+Adobe India Hackathon 2025 - Round 1B: Persona-Driven Document Intelligence
+High-performance Python solution for intelligent PDF processing and summarization
 """
 
 import os
 import json
-import re
 import time
+import re
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
 from pathlib import Path
+from typing import List, Dict, Tuple, Any
+import warnings
+warnings.filterwarnings("ignore")
 
-# Core dependencies
 import fitz  # PyMuPDF
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from transformers import pipeline, T5Tokenizer, T5ForConditionalGeneration
 from sklearn.metrics.pairwise import cosine_similarity
-import torch
-
-# Set PyTorch to CPU-only mode
-torch.set_num_threads(4)
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-
-# Configuration
-INPUT_DIR = "/app/input"
-OUTPUT_DIR = "/app/output"
-PDF_DIR = os.path.join(INPUT_DIR, "PDFs")
-MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2"
-CHUNK_SIZE = 800  # Optimal chunk size for semantic coherence
-TOP_K_SECTIONS = 5
-MIN_SECTION_LENGTH = 50  # Minimum characters for a valid section
 
 
-class DocumentProcessor:
-    """Handles PDF parsing and text extraction with metadata."""
+class DocumentIntelligence:
+    def __init__(self, models_dir: str = "./models"):
+        """Initialize the Document Intelligence system with local models."""
+        self.models_dir = Path(models_dir)
+        self.embedding_model = None
+        self.summarizer = None
+        self.tokenizer = None
+        
+        # Load models
+        self._load_models()
     
-    def __init__(self):
-        self.documents = {}
+    def _load_models(self):
+        """Load all required models from local storage."""
+        print("Loading models...")
         
-    def extract_text_from_pdf(self, pdf_path: str, doc_title: str) -> Dict[str, Any]:
-        """
-        Extract text content page-wise from a PDF document.
+        # Create models directory if it doesn't exist
+        self.models_dir.mkdir(exist_ok=True)
         
-        Args:
-            pdf_path: Path to the PDF file
-            doc_title: Document title for metadata
+        try:
+            # Load sentence transformer for embeddings
+            embedding_path = self.models_dir / "all-MiniLM-L6-v2"
+            if embedding_path.exists() and any(embedding_path.iterdir()):
+                print("Loading existing embedding model...")
+                self.embedding_model = SentenceTransformer(str(embedding_path))
+            else:
+                print("Downloading embedding model...")
+                self.embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                self.embedding_model.save(str(embedding_path))
             
-        Returns:
-            Dictionary with document metadata and page-wise content
-        """
+            # Load T5 model for summarization
+            t5_path = self.models_dir / "t5-small"
+            if t5_path.exists() and any(t5_path.iterdir()):
+                print("Loading existing T5 model...")
+                self.tokenizer = T5Tokenizer.from_pretrained(str(t5_path))
+                model = T5ForConditionalGeneration.from_pretrained(str(t5_path))
+                self.summarizer = pipeline("summarization", 
+                                         model=model, 
+                                         tokenizer=self.tokenizer,
+                                         device=-1)  # CPU only
+            else:
+                print("Downloading T5 model...")
+                self.tokenizer = T5Tokenizer.from_pretrained('t5-small')
+                model = T5ForConditionalGeneration.from_pretrained('t5-small')
+                self.tokenizer.save_pretrained(str(t5_path))
+                model.save_pretrained(str(t5_path))
+                self.summarizer = pipeline("summarization", 
+                                         model=model, 
+                                         tokenizer=self.tokenizer,
+                                         device=-1)
+            
+            print("Models loaded successfully!")
+            
+        except Exception as e:
+            print(f"Error loading models: {str(e)}")
+            raise RuntimeError(f"Failed to load required models: {str(e)}")
+    
+    def extract_pdf_content(self, pdf_path: str) -> List[Dict[str, Any]]:
+        """Extract meaningful content chunks from PDF using improved parsing."""
+        content_chunks = []
+        
         try:
             doc = fitz.open(pdf_path)
-            pages_content = []
             
             for page_num in range(len(doc)):
-                page = doc[page_num]
+                page = doc.load_page(page_num)
                 text = page.get_text()
                 
-                # Clean and normalize text
-                cleaned_text = self._clean_text(text)
+                if not text.strip():
+                    continue
                 
-                if len(cleaned_text) >= MIN_SECTION_LENGTH:
-                    # Detect sections within the page
-                    sections = self._detect_sections(cleaned_text, page_num + 1)
-                    pages_content.extend(sections)
+                # Split text into meaningful paragraphs and sections
+                paragraphs = self._extract_meaningful_paragraphs(text)
+                
+                for para in paragraphs:
+                    if len(para['content'].split()) >= 10:  # Only meaningful content
+                        content_chunks.append({
+                            'document': os.path.basename(pdf_path),
+                            'page_number': page_num + 1,
+                            'section_title': para['title'],
+                            'content': para['content'],
+                            'word_count': len(para['content'].split())
+                        })
             
             doc.close()
             
-            return {
-                'filename': os.path.basename(pdf_path),
-                'title': doc_title,
-                'total_pages': len(doc),
-                'sections': pages_content
-            }
-            
         except Exception as e:
             print(f"Error processing {pdf_path}: {str(e)}")
-            return {'filename': os.path.basename(pdf_path), 'title': doc_title, 'sections': []}
-    
-    def _clean_text(self, text: str) -> str:
-        """Clean and normalize extracted text."""
-        # Remove excessive whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove special characters that might interfere
-        text = re.sub(r'[^\w\s\-.,;:!?()"]', ' ', text)
-        # Normalize spacing
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
-    
-    def _detect_sections(self, text: str, page_num: int) -> List[Dict[str, Any]]:
-        """
-        Detect logical sections within a page of text.
         
-        Args:
-            text: Page text content
-            page_num: Page number
+        return content_chunks
+    
+    def _extract_meaningful_paragraphs(self, text: str) -> List[Dict[str, str]]:
+        """Extract meaningful paragraphs with proper titles."""
+        paragraphs = []
+        lines = text.split('\n')
+        
+        current_content = ""
+        current_title = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
             
-        Returns:
-            List of section dictionaries with metadata
-        """
-        sections = []
+            # Check if this line could be a title/header
+            if self._is_potential_title(line):
+                # Save previous paragraph if it has substantial content
+                if current_content.strip() and len(current_content.split()) >= 10:
+                    paragraphs.append({
+                        'title': current_title or self._generate_title_from_content(current_content),
+                        'content': current_content.strip()
+                    })
+                
+                current_title = line
+                current_content = ""
+            else:
+                current_content += line + " "
         
-        # Split by potential section headers (heuristic approach)
-        # Look for patterns like: "Title:", "Chapter X", numbered sections, etc.
-        section_patterns = [
-            r'\n[A-Z][^.]*:',  # Lines ending with colon (likely headers)
-            r'\n\d+\.\s+[A-Z]',  # Numbered sections
-            r'\n[A-Z][A-Z\s]{10,50}\n',  # All caps headers
+        # Add the last paragraph
+        if current_content.strip() and len(current_content.split()) >= 10:
+            paragraphs.append({
+                'title': current_title or self._generate_title_from_content(current_content),
+                'content': current_content.strip()
+            })
+        
+        return paragraphs
+    
+    def _is_potential_title(self, line: str) -> bool:
+        """Improved title detection."""
+        line = line.strip()
+        
+        if len(line) < 3 or len(line) > 100:
+            return False
+        
+        # Common title patterns
+        title_patterns = [
+            r'^\d+\.?\s+[A-Z]',  # "1. Introduction"
+            r'^[A-Z][A-Z\s]{2,}$',  # "INTRODUCTION"
+            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # "Introduction"
+            r'^\d+\.\d+',  # "1.1 Background"
+            r'^(Abstract|Introduction|Conclusion|References|Methodology|Results|Discussion|Overview|Summary)$',
+            r'^Chapter\s+\d+',
+            r'^Section\s+\d+',
+            r'^[A-Z][a-z]+(\s+(and|or|of|in|for|with|to)\s+[A-Z][a-z]+)*$',  # "Tips and Tricks"
         ]
         
-        split_points = [0]
-        for pattern in section_patterns:
-            matches = list(re.finditer(pattern, text))
-            split_points.extend([m.start() for m in matches])
+        for pattern in title_patterns:
+            if re.match(pattern, line):
+                return True
         
-        split_points.append(len(text))
-        split_points = sorted(set(split_points))
+        # Heuristic: short lines that start with capital and don't end with punctuation
+        words = line.split()
+        if (len(words) <= 8 and 
+            line[0].isupper() and 
+            not line.endswith(('.', ',', ';', ':', '!', '?')) and
+            not any(word.islower() and len(word) > 3 for word in words[:2])):  # Avoid sentences
+            return True
         
-        # Create sections from split points
-        for i in range(len(split_points) - 1):
-            start = split_points[i]
-            end = split_points[i + 1]
-            section_text = text[start:end].strip()
-            
-            if len(section_text) >= MIN_SECTION_LENGTH:
-                # Extract potential title from first line
-                lines = section_text.split('\n')
-                title = self._extract_section_title(lines[0] if lines else "")
-                
-                # Create chunks if section is too long
-                chunks = self._create_chunks(section_text, CHUNK_SIZE)
-                
-                for chunk_idx, chunk in enumerate(chunks):
-                    section_title = f"{title}" if chunk_idx == 0 else f"{title} (Part {chunk_idx + 1})"
-                    sections.append({
-                        'title': section_title,
-                        'content': chunk,
-                        'page_number': page_num,
-                        'section_index': len(sections),
-                        'chunk_index': chunk_idx
-                    })
-        
-        # If no sections detected, treat entire page as one section
-        if not sections and len(text) >= MIN_SECTION_LENGTH:
-            chunks = self._create_chunks(text, CHUNK_SIZE)
-            for chunk_idx, chunk in enumerate(chunks):
-                title = self._extract_section_title(text.split('\n')[0] if text else f"Page {page_num}")
-                section_title = f"{title}" if chunk_idx == 0 else f"{title} (Part {chunk_idx + 1})"
-                sections.append({
-                    'title': section_title,
-                    'content': chunk,
-                    'page_number': page_num,
-                    'section_index': chunk_idx,
-                    'chunk_index': chunk_idx
-                })
-        
-        return sections
+        return False
     
-    def _extract_section_title(self, first_line: str) -> str:
-        """Extract a meaningful title from the first line of a section."""
-        # Clean the line
-        title = first_line.strip()
-        # Remove common artifacts
-        title = re.sub(r'^[\d\-\.\s]+', '', title)  # Remove leading numbers/dashes
-        title = re.sub(r':$', '', title)  # Remove trailing colon
-        # Limit length
-        if len(title) > 80:
-            title = title[:77] + "..."
-        return title if title else "Untitled Section"
+    def _generate_title_from_content(self, content: str) -> str:
+        """Generate a title from content if no explicit title found."""
+        words = content.split()[:8]
+        title = ' '.join(words)
+        if len(title) > 50:
+            title = title[:47] + "..."
+        return title
     
-    def _create_chunks(self, text: str, chunk_size: int) -> List[str]:
-        """
-        Split text into chunks of approximately chunk_size characters,
-        preserving sentence boundaries when possible.
-        """
-        if len(text) <= chunk_size:
-            return [text]
-        
-        chunks = []
-        sentences = re.split(r'[.!?]+\s+', text)
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= chunk_size:
-                current_chunk += sentence + ". "
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + ". "
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return chunks
-    
-    def process_all_documents(self, document_list: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Process all PDF documents and return structured content."""
-        all_documents = {}
-        
-        for doc_info in document_list:
-            filename = doc_info['filename']
-            title = doc_info['title']
-            pdf_path = os.path.join(PDF_DIR, filename)
-            
-            if os.path.exists(pdf_path):
-                print(f"Processing: {filename}")
-                doc_data = self.extract_text_from_pdf(pdf_path, title)
-                all_documents[filename] = doc_data
-            else:
-                print(f"Warning: File not found: {pdf_path}")
-        
-        return all_documents
-
-
-class SemanticAnalyzer:
-    """Handles embedding generation and similarity computation."""
-    
-    def __init__(self, model_name: str = MODEL_NAME):
-        print(f"Loading embedding model: {model_name}")
-        # Force CPU usage
-        self.model = SentenceTransformer(model_name, device='cpu')
-        # Optimize for CPU inference
-        self.model.eval()
-        torch.set_grad_enabled(False)
-        
-    def create_query_embedding(self, persona: str, job_to_be_done: str) -> np.ndarray:
-        """Create embedding for the search query (persona + job)."""
-        query_text = f"Persona: {persona}. Task: {job_to_be_done}"
-        return self.model.encode([query_text], convert_to_tensor=False)[0]
-    
-    def embed_sections(self, all_sections: List[Dict[str, Any]]) -> np.ndarray:
-        """Generate embeddings for all document sections."""
-        if not all_sections:
-            return np.array([])
-        
-        # Prepare texts for embedding
-        texts = []
-        for section in all_sections:
-            # Combine title and content for better semantic understanding
-            combined_text = f"{section['title']}. {section['content']}"
-            texts.append(combined_text)
-        
-        print(f"Generating embeddings for {len(texts)} sections...")
-        
-        # Generate embeddings in batches for efficiency
-        batch_size = 32
-        embeddings = []
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            batch_embeddings = self.model.encode(batch, convert_to_tensor=False, show_progress_bar=False)
-            embeddings.extend(batch_embeddings)
-        
-        return np.array(embeddings)
-    
-    def compute_similarities(self, query_embedding: np.ndarray, section_embeddings: np.ndarray) -> np.ndarray:
-        """Compute cosine similarities between query and all sections."""
-        if section_embeddings.size == 0:
-            return np.array([])
-        
-        query_embedding = query_embedding.reshape(1, -1)
-        similarities = cosine_similarity(query_embedding, section_embeddings)[0]
-        return similarities
-
-
-class SectionExtractor:
-    """Handles section ranking and extraction of top relevant sections."""
-    
-    def __init__(self, top_k: int = TOP_K_SECTIONS):
-        self.top_k = top_k
-    
-    def extract_top_sections(self, 
-                           all_sections: List[Dict[str, Any]], 
-                           similarities: np.ndarray,
-                           documents: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Extract and rank the top K most relevant sections.
-        
-        Returns:
-            List of top sections with metadata and ranking
-        """
-        if len(similarities) == 0:
+    def rank_content_by_persona_and_job(self, content_chunks: List[Dict], persona: str, job_to_be_done: str, top_k: int = 5) -> List[Dict]:
+        """Rank content by relevance to persona, job, and PDF file names using semantic similarity."""
+        if not content_chunks:
             return []
         
-        # Get indices of top K sections
-        top_indices = np.argsort(similarities)[::-1][:self.top_k]
+        # Create a combined query that includes both persona and job context
+        persona_job_query = f"As a {persona}, I need to {job_to_be_done}"
         
-        extracted_sections = []
+        # Create embeddings for the persona-job query
+        query_embedding = self.embedding_model.encode([persona_job_query])
         
-        for rank, idx in enumerate(top_indices, 1):
-            section = all_sections[idx]
-            similarity_score = similarities[idx]
+        # Create embeddings for all content chunks with enhanced context
+        content_texts = []
+        for chunk in content_chunks:
+            # Extract meaningful keywords from PDF filename
+            pdf_name = chunk['document']
+            filename_context = self._extract_filename_context(pdf_name)
             
-            # Find the document this section belongs to
-            doc_filename = None
-            for filename, doc_data in documents.items():
-                if any(s['section_index'] == section['section_index'] and 
-                      s['page_number'] == section['page_number'] 
-                      for s in doc_data['sections']):
-                    doc_filename = filename
-                    break
-            
-            extracted_section = {
-                'document': doc_filename or "Unknown",
-                'section_title': section['title'],
-                'importance_rank': rank,
-                'page_number': section['page_number'],
-                'content': section['content'],
-                'similarity_score': float(similarity_score)
-            }
-            
-            extracted_sections.append(extracted_section)
+            # Combine filename context, title, and content for better matching
+            combined_text = f"{filename_context} {chunk['section_title']} {chunk['content']}"
+            content_texts.append(combined_text)
         
-        return extracted_sections
-
-
-class SummaryGenerator:
-    """Handles text refinement and summary generation."""
+        content_embeddings = self.embedding_model.encode(content_texts)
+        
+        # Calculate cosine similarities
+        similarities = cosine_similarity(query_embedding, content_embeddings)[0]
+        
+        # Add similarity scores and filename relevance
+        for i, chunk in enumerate(content_chunks):
+            base_similarity = float(similarities[i])
+            
+            # Calculate filename relevance boost
+            filename_boost = self._calculate_filename_relevance(
+                chunk['document'], persona, job_to_be_done
+            )
+            
+            # Combine similarity with filename relevance (weighted)
+            chunk['similarity_score'] = base_similarity + (filename_boost * 0.3)  # 30% weight for filename
+            chunk['filename_relevance'] = filename_boost
+        
+        # Sort by combined score (descending) and take top_k
+        ranked_content = sorted(content_chunks, key=lambda x: x['similarity_score'], reverse=True)
+        
+        # Add importance rank
+        for i, chunk in enumerate(ranked_content[:top_k]):
+            chunk['importance_rank'] = i + 1
+        
+        return ranked_content[:top_k]
     
-    def refine_section_content(self, content: str, max_length: int = 800) -> str:
-        """
-        Refine and clean section content for final output.
+    def _extract_filename_context(self, pdf_filename: str) -> str:
+        """Extract meaningful context from PDF filename."""
+        # Remove file extension and clean filename
+        name = pdf_filename.replace('.pdf', '').replace('.PDF', '')
         
-        Args:
-            content: Raw section content
-            max_length: Maximum length for refined content
-            
-        Returns:
-            Cleaned and refined text
-        """
-        # Basic text cleaning and refinement
-        refined = content.strip()
+        # Replace common separators with spaces
+        name = name.replace('_', ' ').replace('-', ' ').replace('.', ' ')
         
-        # Ensure proper sentence structure
-        sentences = re.split(r'[.!?]+\s*', refined)
-        clean_sentences = []
+        # Split into words and filter out common non-meaningful words
+        words = name.split()
+        meaningful_words = []
+        
+        skip_words = {'ideas', 'tips', 'guide', 'manual', 'document', 'file', 'pdf', 'part', 'section'}
+        
+        for word in words:
+            word_clean = word.lower().strip()
+            if len(word_clean) > 2 and word_clean not in skip_words:
+                meaningful_words.append(word_clean)
+        
+        return ' '.join(meaningful_words)
+    
+    def _calculate_filename_relevance(self, pdf_filename: str, persona: str, job_to_be_done: str) -> float:
+        """Calculate how relevant the PDF filename is to the persona and job."""
+        filename_lower = pdf_filename.lower()
+        persona_lower = persona.lower()
+        job_lower = job_to_be_done.lower()
+        
+        relevance_score = 0.0
+        
+        # Extract keywords from filename
+        filename_keywords = self._extract_filename_context(pdf_filename).split()
+        
+        # Check for direct matches with persona keywords
+        persona_keywords = persona_lower.split()
+        for p_word in persona_keywords:
+            if len(p_word) > 3:  # Skip short words
+                for f_word in filename_keywords:
+                    if p_word in f_word or f_word in p_word:
+                        relevance_score += 0.4
+        
+        # Check for direct matches with job keywords
+        job_keywords = job_lower.split()
+        for j_word in job_keywords:
+            if len(j_word) > 3:  # Skip short words like 'a', 'the', 'of'
+                for f_word in filename_keywords:
+                    if j_word in f_word or f_word in j_word:
+                        relevance_score += 0.5
+        
+        # Special keyword matching for common domains
+        domain_keywords = {
+            'food': ['breakfast', 'lunch', 'dinner', 'meal', 'recipe', 'cooking', 'vegetarian', 'vegan'],
+            'travel': ['travel', 'trip', 'vacation', 'destination', 'hotel', 'flight', 'tourism'],
+            'business': ['business', 'corporate', 'company', 'management', 'strategy', 'finance'],
+            'health': ['health', 'medical', 'wellness', 'fitness', 'nutrition', 'diet'],
+            'education': ['education', 'learning', 'study', 'academic', 'research', 'university']
+        }
+        
+        # Check if filename contains domain-specific keywords that match persona/job
+        for domain, keywords in domain_keywords.items():
+            if domain in persona_lower or domain in job_lower:
+                for keyword in keywords:
+                    if keyword in filename_lower:
+                        relevance_score += 0.3
+        
+        # Normalize score to 0-1 range
+        return min(relevance_score, 1.0)
+    
+    def generate_persona_specific_summaries(self, content_chunks: List[Dict], persona: str, job_to_be_done: str) -> List[Dict]:
+        """Generate persona-specific summaries with enhanced quality metrics and intelligent formatting."""
+        summaries = []
+        
+        for chunk in content_chunks:
+            try:
+                # Create persona-specific prompt for summarization
+                content = chunk['content']
+                pdf_filename = chunk.get('document', '')
+                
+                # Persona-specific processing with filename context
+                refined_text = self._create_persona_specific_summary(content, persona, job_to_be_done, pdf_filename)
+                
+                summaries.append({
+                    'document': chunk['document'],
+                    'page_number': chunk['page_number'],
+                    'refined_text': refined_text
+                })
+                
+            except Exception as e:
+                print(f"Error creating summary for {chunk.get('document', 'unknown')}: {str(e)}")
+                # Enhanced fallback with intelligent formatting
+                content = chunk.get('content', '')
+                fallback_text = content[:300] + "..." if len(content) > 300 else content
+                formatted_fallback = self._intelligent_text_formatter(fallback_text)
+                
+                summaries.append({
+                    'document': chunk.get('document', 'unknown'),
+                    'page_number': chunk.get('page_number', 1),
+                    'refined_text': formatted_fallback
+                })
+        
+        return summaries
+    
+    def _generate_dynamic_keywords(self, persona: str, job_to_be_done: str) -> List[str]:
+        """Dynamically generate keywords based on persona and job description using NLP analysis."""
+        keywords = set()
+        
+        # Extract keywords from persona
+        persona_words = persona.lower().split()
+        for word in persona_words:
+            if len(word) > 2:  # Skip very short words
+                keywords.add(word)
+        
+        # Extract keywords from job description
+        job_words = job_to_be_done.lower().split()
+        for word in job_words:
+            if len(word) > 3:  # Skip short words for job description
+                keywords.add(word)
+        
+        # Add semantic expansions based on common professional contexts
+        semantic_expansions = {
+            'planner': ['planning', 'schedule', 'organize', 'coordination', 'timeline', 'itinerary'],
+            'manager': ['management', 'leadership', 'team', 'strategy', 'operations', 'oversight'],
+            'doctor': ['medical', 'health', 'patient', 'treatment', 'diagnosis', 'clinical'],
+            'researcher': ['research', 'analysis', 'study', 'data', 'methodology', 'findings'],
+            'contractor': ['contract', 'service', 'delivery', 'project', 'requirements', 'specifications'],
+            'scientist': ['scientific', 'analysis', 'experiment', 'data', 'methodology', 'results'],
+            'professional': ['professional', 'expertise', 'standards', 'quality', 'compliance'],
+            'consultant': ['consulting', 'advisory', 'recommendations', 'solutions', 'expertise'],
+            'analyst': ['analysis', 'data', 'insights', 'trends', 'evaluation', 'metrics'],
+            'specialist': ['specialized', 'expertise', 'technical', 'specific', 'focused'],
+            'prepare': ['preparation', 'planning', 'setup', 'organize', 'arrange'],
+            'create': ['creation', 'develop', 'design', 'build', 'generate'],
+            'manage': ['management', 'control', 'oversee', 'coordinate', 'supervise'],
+            'analyze': ['analysis', 'evaluation', 'assessment', 'review', 'examination'],
+            'develop': ['development', 'creation', 'building', 'design', 'implementation'],
+            'food': ['nutrition', 'dietary', 'ingredients', 'recipes', 'cooking', 'meal'],
+            'travel': ['tourism', 'destination', 'accommodation', 'transportation', 'itinerary'],
+            'business': ['corporate', 'commercial', 'enterprise', 'organization', 'company'],
+            'health': ['wellness', 'medical', 'fitness', 'healthcare', 'treatment'],
+            'education': ['learning', 'academic', 'study', 'training', 'knowledge'],
+            'technology': ['technical', 'digital', 'software', 'systems', 'innovation'],
+            'finance': ['financial', 'monetary', 'budget', 'cost', 'investment'],
+            'legal': ['law', 'compliance', 'regulation', 'policy', 'procedure'],
+            'marketing': ['promotion', 'advertising', 'branding', 'campaign', 'outreach']
+        }
+        
+        # Add semantic expansions for matching words
+        for base_word, expansions in semantic_expansions.items():
+            if base_word in ' '.join([persona.lower(), job_to_be_done.lower()]):
+                keywords.update(expansions)
+        
+        # Convert to list and limit to reasonable number
+        keyword_list = list(keywords)[:15]  # Limit to 15 most relevant keywords
+        
+        return keyword_list
+    
+    def _intelligent_text_formatter(self, text: str) -> str:
+        """Intelligently format text with proper capitalization, punctuation, and readability."""
+        if not text or len(text.strip()) == 0:
+            return text
+        
+        # Clean and normalize text
+        text = text.strip()
+        
+        # Split into sentences and process each
+        sentences = text.split('.')
+        formatted_sentences = []
         
         for sentence in sentences:
             sentence = sentence.strip()
-            if len(sentence) > 10:  # Filter out very short fragments
-                # Ensure sentence ends with proper punctuation
-                if not sentence.endswith(('.', '!', '?')):
-                    sentence += '.'
-                clean_sentences.append(sentence)
-        
-        refined_text = ' '.join(clean_sentences)
-        
-        # Truncate if too long while preserving sentence boundaries
-        if len(refined_text) > max_length:
-            sentences = refined_text.split('. ')
-            truncated = ""
-            for sentence in sentences:
-                if len(truncated) + len(sentence) + 2 <= max_length:
-                    truncated += sentence + '. '
-                else:
-                    break
-            refined_text = truncated.strip()
-        
-        return refined_text
-    
-    def generate_subsection_analysis(self, top_sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Generate refined subsection analysis for the final output."""
-        subsection_analysis = []
-        
-        for section in top_sections:
-            refined_content = self.refine_section_content(section['content'])
+            if len(sentence) < 2:
+                continue
             
-            analysis = {
-                'document': section['document'],
-                'refined_text': refined_content,
-                'page_number': section['page_number']
+            # Capitalize first letter
+            sentence = sentence[0].upper() + sentence[1:] if len(sentence) > 1 else sentence.upper()
+            
+            # Fix common formatting issues
+            sentence = sentence.replace(' ,', ',')
+            sentence = sentence.replace(' .', '.')
+            sentence = sentence.replace('  ', ' ')
+            
+            # Ensure proper spacing after punctuation
+            sentence = sentence.replace(',', ', ').replace('  ', ' ')
+            sentence = sentence.replace(':', ': ').replace('  ', ' ')
+            
+            formatted_sentences.append(sentence)
+        
+        # Join sentences with proper punctuation
+        result = '. '.join(formatted_sentences)
+        
+        # Ensure proper ending
+        if result and not result.endswith('.'):
+            result += '.'
+        
+        return result
+    
+    def _calculate_content_confidence(self, content: str, persona: str, job_to_be_done: str) -> float:
+        """Calculate confidence score for content relevance to persona and job."""
+        if not content:
+            return 0.0
+        
+        content_lower = content.lower()
+        persona_lower = persona.lower()
+        job_lower = job_to_be_done.lower()
+        
+        # Get dynamic keywords
+        keywords = self._generate_dynamic_keywords(persona, job_to_be_done)
+        
+        # Calculate various relevance metrics
+        keyword_matches = sum(1 for keyword in keywords if keyword in content_lower)
+        persona_word_matches = sum(1 for word in persona_lower.split() if word in content_lower and len(word) > 2)
+        job_word_matches = sum(1 for word in job_lower.split() if word in content_lower and len(word) > 3)
+        
+        # Normalize scores
+        keyword_score = min(keyword_matches / max(len(keywords), 1), 1.0)
+        persona_score = min(persona_word_matches / max(len(persona_lower.split()), 1), 1.0)
+        job_score = min(job_word_matches / max(len(job_lower.split()), 1), 1.0)
+        
+        # Weighted confidence calculation
+        confidence = (keyword_score * 0.4 + persona_score * 0.3 + job_score * 0.3)
+        
+        return round(confidence, 3)
+    
+    def _enhance_content_quality(self, content: str, persona: str, job_to_be_done: str) -> Dict[str, Any]:
+        """Enhance content with quality metrics and intelligent processing."""
+        if not content:
+            return {
+                "enhanced_text": "",
+                "confidence_score": 0.0,
+                "quality_metrics": {
+                    "readability": "poor",
+                    "relevance": "low",
+                    "completeness": "incomplete"
+                }
             }
+        
+        # Format text intelligently
+        enhanced_text = self._intelligent_text_formatter(content)
+        
+        # Calculate confidence
+        confidence = self._calculate_content_confidence(content, persona, job_to_be_done)
+        
+        # Quality metrics
+        word_count = len(content.split())
+        sentence_count = len([s for s in content.split('.') if s.strip()])
+        
+        # Determine quality ratings
+        readability = "excellent" if word_count > 20 and sentence_count > 1 else "good" if word_count > 10 else "fair"
+        relevance = "high" if confidence > 0.6 else "medium" if confidence > 0.3 else "low"
+        completeness = "complete" if word_count > 15 and sentence_count > 1 else "partial" if word_count > 5 else "minimal"
+        
+        return {
+            "enhanced_text": enhanced_text,
+            "confidence_score": confidence,
+            "quality_metrics": {
+                "readability": readability,
+                "relevance": relevance,
+                "completeness": completeness,
+                "word_count": word_count,
+                "sentence_count": sentence_count
+            }
+        }
+    
+    def _create_persona_specific_summary(self, content: str, persona: str, job_to_be_done: str, pdf_filename: str = "") -> str:
+        """Create a summary tailored to the specific persona, job requirements, and PDF context using T5 model."""
+        
+        # Generate focus keywords dynamically based on persona and job
+        focus_keywords = self._generate_dynamic_keywords(persona, job_to_be_done)
+        
+        # Extract filename context for additional relevance
+        filename_context = self._extract_filename_context(pdf_filename) if pdf_filename else ""
+        filename_keywords = filename_context.split()
+        
+        # Clean and prepare content for summarization
+        content = content.strip()
+        if len(content) < 50:
+            return content  # Too short to summarize meaningfully
+        
+        # Try T5 summarization with persona and filename context first
+        try:
+            # Limit content length for T5 model
+            max_content_length = 400
+            if len(content) > max_content_length:
+                # Extract most relevant parts first
+                sentences = content.split('.')
+                relevant_sentences = []
+                
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if len(sentence) < 10:
+                        continue
+                    
+                    # Score sentence based on persona relevance, job keywords, and filename context
+                    score = 0
+                    sentence_lower = sentence.lower()
+                    job_lower = job_to_be_done.lower()
+                    
+                    # Check for persona-specific keywords
+                    for keyword in focus_keywords:
+                        if keyword in sentence_lower:
+                            score += 2
+                    
+                    # Check for job-specific keywords
+                    job_words = job_lower.split()
+                    for word in job_words:
+                        if len(word) > 3 and word in sentence_lower:
+                            score += 3
+                    
+                    # Check for filename-related keywords (new)
+                    for f_keyword in filename_keywords:
+                        if len(f_keyword) > 3 and f_keyword in sentence_lower:
+                            score += 2
+                    
+                    relevant_sentences.append((sentence, score))
+                
+                # Sort by relevance and take top sentences that fit within limit
+                relevant_sentences.sort(key=lambda x: x[1], reverse=True)
+                
+                selected_content = ""
+                for sentence, score in relevant_sentences:
+                    if len(selected_content + sentence) < max_content_length:
+                        selected_content += sentence + ". "
+                    else:
+                        break
+                
+                content = selected_content.strip() if selected_content else content[:max_content_length]
             
-            subsection_analysis.append(analysis)
-        
-        return subsection_analysis
-
-
-def load_input_configuration() -> Tuple[Dict[str, Any], str, str, List[Dict[str, str]]]:
-    """Load and parse the input JSON configuration."""
-    input_path = os.path.join(INPUT_DIR, "challenge1b_input.json")
+            # Create summarization prompt with persona and filename context
+            context_info = f"{persona}"
+            if filename_context:
+                context_info += f" working with {filename_context}"
+            
+            input_text = f"summarize for {context_info}: {content}"
+            
+            # Generate summary using T5
+            summary_result = self.summarizer(
+                input_text, 
+                max_length=min(150, len(content.split()) + 20),  # Dynamic max length
+                min_length=20, 
+                do_sample=False,
+                truncation=True
+            )
+            
+            summary = summary_result[0]['summary_text']
+            
+            # Post-process summary to ensure it's persona-relevant and filename-aware
+            if summary and len(summary) > 10:
+                # Apply intelligent formatting for proper capitalization and readability
+                summary = self._intelligent_text_formatter(summary)
+                return summary
+            else:
+                raise Exception("Summary too short")
+                
+        except Exception as e:
+            # Fallback: Create a manual summary from most relevant sentences
+            sentences = content.split('.')
+            relevant_sentences = []
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence) < 15:
+                    continue
+                
+                # Score sentence based on persona relevance, job keywords, and filename context
+                score = 0
+                sentence_lower = sentence.lower()
+                job_lower = job_to_be_done.lower()
+                
+                # Check for persona-specific keywords
+                for keyword in focus_keywords:
+                    if keyword in sentence_lower:
+                        score += 2
+                
+                # Check for job-specific keywords
+                job_words = job_lower.split()
+                for word in job_words:
+                    if len(word) > 3 and word in sentence_lower:
+                        score += 3
+                
+                # Check for filename-related keywords (new)
+                for f_keyword in filename_keywords:
+                    if len(f_keyword) > 3 and f_keyword in sentence_lower:
+                        score += 2
+                
+                if score > 0:
+                    relevant_sentences.append((sentence, score))
+            
+            # Sort by relevance score and create summary
+            relevant_sentences.sort(key=lambda x: x[1], reverse=True)
+            
+            if relevant_sentences:
+                # Take top 2-3 most relevant sentences and create a coherent summary
+                top_sentences = [sent[0] for sent in relevant_sentences[:2]]
+                summary = '. '.join(top_sentences)
+                # Apply intelligent formatting for proper capitalization and readability
+                summary = self._intelligent_text_formatter(summary)
+                return summary
+            else:
+                # Final fallback with intelligent formatting
+                fallback_content = content[:150] + "..." if len(content) > 150 else content
+                return self._intelligent_text_formatter(fallback_content)
     
-    try:
-        with open(input_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+    def process_documents(self, pdf_files: List[Path], persona: str, job_to_be_done: str) -> Dict[str, Any]:
+        """Main processing pipeline with persona-specific analysis."""
+        start_time = time.time()
         
-        persona = config['persona']['role']
-        job_to_be_done = config['job_to_be_done']['task']
-        documents = config['documents']
+        if not pdf_files:
+            print(f"Warning: No PDF files provided")
+            # Return empty result structure
+            return {
+                "metadata": {
+                    "input_documents": [],
+                    "persona": persona,
+                    "job_to_be_done": job_to_be_done,
+                    "processing_timestamp": datetime.now().isoformat()
+                },
+                "extracted_sections": [],
+                "subsection_analysis": []
+            }
         
-        return config, persona, job_to_be_done, documents
-    
-    except Exception as e:
-        raise Exception(f"Error loading input configuration: {str(e)}")
-
-
-def save_output_json(result: Dict[str, Any]) -> None:
-    """Save the final result to output JSON file."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(OUTPUT_DIR, "challenge1b_output.json")
-    
-    try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=4, ensure_ascii=False)
-        print(f"Output saved to: {output_path}")
-    except Exception as e:
-        raise Exception(f"Error saving output: {str(e)}")
+        print(f"Processing {len(pdf_files)} PDF files")
+        
+        # Extract content from all PDFs
+        all_content = []
+        for i, pdf_file in enumerate(pdf_files, 1):
+            print(f"Processing ({i}/{len(pdf_files)}): {pdf_file.name}")
+            content_chunks = self.extract_pdf_content(str(pdf_file))
+            all_content.extend(content_chunks)
+        
+        print(f"Extracted {len(all_content)} content chunks")
+        
+        # Rank content by persona and job relevance
+        top_content = self.rank_content_by_persona_and_job(all_content, persona, job_to_be_done, top_k=5)
+        
+        print(f"Found {len(top_content)} relevant sections")
+        
+        # Generate persona-specific summaries
+        summaries = self.generate_persona_specific_summaries(top_content, persona, job_to_be_done)
+        
+        # Prepare output in the exact challenge format
+        result = {
+            "metadata": {
+                "input_documents": [pdf.name for pdf in pdf_files],
+                "persona": persona,
+                "job_to_be_done": job_to_be_done,
+                "processing_timestamp": datetime.now().isoformat()
+            },
+            "extracted_sections": [
+                {
+                    "document": chunk['document'],
+                    "section_title": chunk['section_title'],
+                    "importance_rank": chunk['importance_rank'],
+                    "page_number": chunk['page_number']
+                }
+                for chunk in top_content
+            ],
+            "subsection_analysis": [
+                {
+                    "document": summary['document'],
+                    "refined_text": summary['refined_text'],
+                    "page_number": summary['page_number']
+                }
+                for summary in summaries
+            ]
+        }
+        
+        processing_time = time.time() - start_time
+        print(f"Processing completed in {processing_time:.2f} seconds")
+        
+        return result
 
 
 def main():
-    """Main pipeline execution."""
-    start_time = time.time()
+    """Main execution function."""
+    print("Adobe India Hackathon 2025 - Round 1B")
+    print("Persona-Driven Document Intelligence")
+    print("=" * 50)
     
-    print("=" * 60)
-    print("Document Intelligence System - Starting Pipeline")
-    print("=" * 60)
+    # Configuration
+    import sys
+    
+    # Allow specifying input JSON file as command line argument
+    if len(sys.argv) > 1:
+        INPUT_JSON_FILE = sys.argv[1]
+    else:
+        INPUT_JSON_FILE = "./app/input/challenge1.json"
+    
+    PDF_DIR = "./app/PDFs"
+    OUTPUT_DIR = "./app/output"
+    MODELS_DIR = "./models"
+    
+    # Create directories if they don't exist
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    
+    # Read input from JSON file
+    try:
+        with open(INPUT_JSON_FILE, 'r', encoding='utf-8') as f:
+            input_data = json.load(f)
+        print(f"Successfully loaded input from: {INPUT_JSON_FILE}")
+    except FileNotFoundError:
+        print(f"ERROR: Input JSON file not found: {INPUT_JSON_FILE}")
+        print("Please ensure the input JSON file exists.")
+        print("Usage: python main.py [path_to_input_json]")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON format in {INPUT_JSON_FILE}: {str(e)}")
+        return 1
+    
+    # Extract persona and job from JSON
+    try:
+        persona = input_data["persona"]["role"]
+        job_to_be_done = input_data["job_to_be_done"]["task"]
+        pdf_documents = input_data["documents"]
+        
+        print(f"Persona: {persona}")
+        print(f"Job to be done: {job_to_be_done}")
+        print(f"Documents to process: {len(pdf_documents)}")
+        print()
+        
+    except KeyError as e:
+        print(f"ERROR: Missing required field in JSON: {str(e)}")
+        return 1
+    
+    # Check if PDF directory exists
+    pdf_path = Path(PDF_DIR)
+    if not pdf_path.exists():
+        print(f"ERROR: PDF directory not found: {PDF_DIR}")
+        print("Please ensure the PDFs folder exists.")
+        return 1
+    
+    # Get the specific PDF files mentioned in the JSON
+    pdf_files = []
+    missing_files = []
+    
+    for doc in pdf_documents:
+        pdf_filename = doc["filename"]
+        pdf_file_path = pdf_path / pdf_filename
+        
+        if pdf_file_path.exists():
+            pdf_files.append(pdf_file_path)
+            print(f"   ✓ Found: {pdf_filename}")
+        else:
+            missing_files.append(pdf_filename)
+            print(f"   ✗ Missing: {pdf_filename}")
+    
+    if missing_files:
+        print(f"\nWARNING: {len(missing_files)} PDF files not found in {PDF_DIR}")
+        for missing in missing_files:
+            print(f"   - {missing}")
+        
+        if not pdf_files:
+            print("ERROR: No PDF files found. Cannot proceed.")
+            return 1
+        else:
+            print(f"\nProceeding with {len(pdf_files)} available PDF files...")
+    
+    print()
+    print("Starting document processing...")
+    print("=" * 50)
     
     try:
-        # Step 1: Load input configuration
-        print("\n1. Loading input configuration...")
-        config, persona, job_to_be_done, document_list = load_input_configuration()
-        print(f"   Persona: {persona}")
-        print(f"   Task: {job_to_be_done}")
-        print(f"   Documents: {len(document_list)} files")
+        # Initialize the system
+        print("Initializing Document Intelligence...")
+        doc_intel = DocumentIntelligence(models_dir=MODELS_DIR)
         
-        # Step 2: Process PDF documents
-        print("\n2. Processing PDF documents...")
-        processor = DocumentProcessor()
-        all_documents = processor.process_all_documents(document_list)
+        # Process documents
+        result = doc_intel.process_documents(pdf_files, persona, job_to_be_done)
         
-        # Collect all sections from all documents
-        all_sections = []
-        for doc_data in all_documents.values():
-            all_sections.extend(doc_data['sections'])
+        # Create a unique output filename based on persona and job
+        persona_clean = "".join(c for c in persona if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        persona_clean = persona_clean.replace(' ', '_').lower()
         
-        print(f"   Extracted {len(all_sections)} sections from {len(all_documents)} documents")
+        # Get first few words of job for filename
+        job_words = job_to_be_done.split()[:3]  # First 3 words
+        job_clean = "_".join(word.lower() for word in job_words if word.isalnum())
         
-        # Step 3: Generate embeddings
-        print("\n3. Generating semantic embeddings...")
-        analyzer = SemanticAnalyzer()
+        # Create timestamp for uniqueness
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Create query embedding
-        query_embedding = analyzer.create_query_embedding(persona, job_to_be_done)
+        # Create output filename
+        output_filename = f"{persona_clean}_{job_clean}_{timestamp}.json"
+        output_file = Path(OUTPUT_DIR) / output_filename
         
-        # Generate section embeddings
-        section_embeddings = analyzer.embed_sections(all_sections)
+        # Save result
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
         
-        # Step 4: Compute similarities and rank sections
-        print("\n4. Computing similarities and ranking sections...")
-        similarities = analyzer.compute_similarities(query_embedding, section_embeddings)
-        
-        extractor = SectionExtractor()
-        top_sections = extractor.extract_top_sections(all_sections, similarities, all_documents)
-        
-        print(f"   Selected top {len(top_sections)} most relevant sections")
-        
-        # Step 5: Generate refined summaries
-        print("\n5. Generating refined summaries...")
-        summarizer = SummaryGenerator()
-        subsection_analysis = summarizer.generate_subsection_analysis(top_sections)
-        
-        # Step 6: Build final JSON output
-        print("\n6. Building final JSON output...")
-        
-        # Prepare extracted_sections for output (without content and similarity_score)
-        extracted_sections = []
-        for section in top_sections:
-            extracted_sections.append({
-                'document': section['document'],
-                'section_title': section['section_title'],
-                'importance_rank': section['importance_rank'],
-                'page_number': section['page_number']
-            })
-        
-        # Build final result
-        result = {
-            'metadata': {
-                'input_documents': [doc['filename'] for doc in document_list],
-                'persona': persona,
-                'job_to_be_done': job_to_be_done,
-                'processing_timestamp': datetime.now().isoformat()
-            },
-            'extracted_sections': extracted_sections,
-            'subsection_analysis': subsection_analysis
-        }
-        
-        # Step 7: Save output
-        print("\n7. Saving output...")
-        save_output_json(result)
-        
-        # Performance metrics
-        end_time = time.time()
-        processing_time = end_time - start_time
-        
-        print("\n" + "=" * 60)
-        print("Pipeline completed successfully!")
-        print(f"Total processing time: {processing_time:.2f} seconds")
-        print(f"Processed {len(all_documents)} documents with {len(all_sections)} sections")
-        print(f"Selected {len(top_sections)} most relevant sections")
-        print("=" * 60)
-        
-        return result
+        print()
+        print("Processing completed successfully!")
+        print("=" * 50)
+        print(f"Results saved to: {output_file}")
+        print(f"Documents processed: {len(result['metadata']['input_documents'])}")
+        print(f"Relevant sections found: {len(result['extracted_sections'])}")
+        print(f"Summaries generated: {len(result['subsection_analysis'])}")
+        print()
+        print("Document intelligence analysis complete!")
         
     except Exception as e:
-        print(f"\nError in pipeline execution: {str(e)}")
-        raise
+        print(f"ERROR: {str(e)}")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
