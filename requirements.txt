@@ -1,0 +1,23 @@
+# Document Intelligence System - Requirements
+# CPU-only, lightweight dependencies for offline document processing
+
+# PDF processing
+PyMuPDF==1.23.26
+
+# Semantic embeddings and NLP
+sentence-transformers==2.2.2
+torch>=2.2.0
+transformers>=4.21.0
+
+# Scientific computing
+numpy>=1.21.0
+scikit-learn>=1.0.0
+
+# Standard libraries (included with Python)
+# - json (built-in)
+# - re (built-in)
+# - os (built-in)
+# - time (built-in)
+# - datetime (built-in)
+# - pathlib (built-in)
+# - typing (built-in)
